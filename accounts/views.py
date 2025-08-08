@@ -11,11 +11,11 @@ from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from rest_framework_simplejwt.tokens import RefreshToken
-from django.contrib.auth import authenticate
 from django.db import transaction
-from .serializers import UserSerializer, LoginSerializer
-from .models import User
+from django.contrib.auth import authenticate
+from rest_framework_simplejwt.tokens import RefreshToken
+from .serializers import RegisterSerializer, LoginSerializer, UserReadSerializer
+from .models import User, Profile
 
 
 @api_view(['POST'])
@@ -47,24 +47,30 @@ def register(request):
             }
         }
     """
-    serializer = UserSerializer(data=request.data)
+    # Validate user + profile input only; creation happens below
+    serializer = RegisterSerializer(data=request.data)
     
     if serializer.is_valid():
         try:
             # Use database transaction to ensure data consistency
             with transaction.atomic():
-                user = serializer.save()
+                # Create User and Profile inside the view to keep serializers lean.
+                validated = serializer.validated_data
+                profile_data = validated.pop('profile')
+                user = User.objects.create_user(**validated)
+                Profile.objects.create(user=user, **profile_data)
                 
-                # Generate JWT tokens
+                # Moved token generation into the view to keep serializers focused
+                # on creation/validation only.
                 refresh = RefreshToken.for_user(user)
-                
+
                 return Response({
                     'message': 'User registered successfully',
-                    'user': UserSerializer(user).data,
+                    'user': UserReadSerializer(user).data,
                     'tokens': {
                         'access': str(refresh.access_token),
                         'refresh': str(refresh),
-                    }
+                    },
                 }, status=status.HTTP_201_CREATED)
                 
         except Exception as e:
@@ -103,14 +109,31 @@ def login(request):
     serializer = LoginSerializer(data=request.data)
     
     if serializer.is_valid():
-        user = serializer.validated_data['user']
-        
-        # Generate JWT tokens
+        # Authentication moved out of the serializer and into the view.
+        email = serializer.validated_data['email']
+        password = serializer.validated_data['password']
+
+        # Django's authenticate expects "username" which maps to USERNAME_FIELD (email)
+        user = authenticate(username=email, password=password)
+
+        if not user:
+            return Response({
+                'error': 'Authentication failed',
+                'details': {'non_field_errors': ['Invalid email or password.']}
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if not user.is_active:
+            return Response({
+                'error': 'Authentication failed',
+                'details': {'non_field_errors': ['Your account has been deactivated. Please contact support.']}
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Generate JWT tokens in the view
         refresh = RefreshToken.for_user(user)
-        
+
         return Response({
             'message': 'Login successful',
-            'user': UserSerializer(user).data,
+            'user': UserReadSerializer(user).data,
             'tokens': {
                 'access': str(refresh.access_token),
                 'refresh': str(refresh),
@@ -142,7 +165,7 @@ def me(request):
         Requires valid JWT access token in Authorization header
     """
     try:
-        serializer = UserSerializer(request.user)
+        serializer = UserReadSerializer(request.user)
         return Response({
             'user': serializer.data
         }, status=status.HTTP_200_OK)
